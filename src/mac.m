@@ -38,6 +38,7 @@
 #include <stdlib.h>
 
 #import "ScreenCapturer.h"
+#include "keysym2ucs.h"
 
 /* The main LibVNCServer screen object */
 rfbScreenInfoPtr rfbScreen;
@@ -357,7 +358,29 @@ KbdAddEvent(rfbBool down, rfbKeySym keySym, struct _rfbClientRec* cl)
     } else {
 	/* look for char key */
 	size_t keyCodeFromDict;
-	CFStringRef charStr = CFStringCreateWithCharacters(kCFAllocatorDefault, (UniChar*)&keySym, 1);
+
+	/*
+	   Convert the keysym to Unicode. Keysyms are plain Unicode values
+	   only for Latin-1; for other scripts like Arabic, the keysym
+	   blocks are numerically unrelated to their Unicode blocks.
+	 */
+	UniChar chars[2];
+	int charsCount = 1;
+	long ucs = keysym2ucs(keySym);
+	if(ucs < 0 || ucs > 0x10FFFF) {
+	    /* keysym has no Unicode counterpart, keep old behaviour */
+	    chars[0] = (UniChar)keySym;
+	} else if(ucs < 0x10000) {
+	    chars[0] = (UniChar)ucs;
+	} else {
+	    /* encode as a UTF-16 surrogate pair */
+	    ucs -= 0x10000;
+	    chars[0] = 0xD800 | (ucs >> 10);
+	    chars[1] = 0xDC00 | (ucs & 0x3FF);
+	    charsCount = 2;
+	}
+
+	CFStringRef charStr = CFStringCreateWithCharacters(kCFAllocatorDefault, chars, charsCount);
 	CFMutableDictionaryRef keyMap = charKeyMap;
 	if(isShiftDown && !isAltGrDown)
 	    keyMap = charShiftKeyMap;
@@ -372,7 +395,7 @@ KbdAddEvent(rfbBool down, rfbKeySym keySym, struct _rfbClientRec* cl)
 	} else {
 	    /* last resort: use the symbol's utf-16 value, does not support modifiers though */
 	    keyboardEvent = CGEventCreateKeyboardEvent(eventSource, 0, down);
-	    CGEventKeyboardSetUnicodeString(keyboardEvent, 1, (UniChar*)&keySym);
+	    CGEventKeyboardSetUnicodeString(keyboardEvent, charsCount, chars);
         }
 
 	CFRelease(charStr);
@@ -563,6 +586,8 @@ ScreenInit(int argc, char**argv)
   rfbScreen->kbdAddEvent = KbdAddEvent;
 
   ScreenCapturer *capturer = [[ScreenCapturer alloc] initWithDisplay: displayID
+                                                               width: CGDisplayPixelsWide(displayID)
+                                                              height: CGDisplayPixelsHigh(displayID)
                                                         frameHandler:^(CMSampleBufferRef sampleBuffer) {
           rfbClientIteratorPtr iterator;
           rfbClientPtr cl;
@@ -576,9 +601,35 @@ ScreenInit(int argc, char**argv)
 
           CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 
-          memcpy(backBuffer,
-                 CVPixelBufferGetBaseAddress(pixelBuffer),
-                 CGDisplayPixelsWide(displayID) *  CGDisplayPixelsHigh(displayID) * 4);
+          if(CVPixelBufferGetWidth(pixelBuffer) != CGDisplayPixelsWide(displayID)
+             || CVPixelBufferGetHeight(pixelBuffer) != CGDisplayPixelsHigh(displayID)) {
+              static rfbBool sizeMismatchLogged = FALSE;
+              if(!sizeMismatchLogged) {
+                  fprintf(stderr, "Captured frame is %ldx%ld, but framebuffer is %zux%zu - skipping frame\n",
+                          (long)CVPixelBufferGetWidth(pixelBuffer), (long)CVPixelBufferGetHeight(pixelBuffer),
+                          CGDisplayPixelsWide(displayID), CGDisplayPixelsHigh(displayID));
+                  sizeMismatchLogged = TRUE;
+              }
+              CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+              return;
+          }
+
+          /*
+            Copy row by row: the pixel buffer's bytesPerRow can include padding,
+            so a single flat memcpy of the whole buffer would shear the image.
+          */
+          {
+              const uint8_t *srcBase = CVPixelBufferGetBaseAddress(pixelBuffer);
+              size_t srcBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer);
+              uint8_t *dstBase = backBuffer;
+              size_t dstBytesPerRow = CGDisplayPixelsWide(displayID) * 4;
+              size_t bytesPerRowToCopy = srcBytesPerRow < dstBytesPerRow ? srcBytesPerRow : dstBytesPerRow;
+
+              for(size_t y = 0; y < CGDisplayPixelsHigh(displayID); ++y)
+                  memcpy(dstBase + y * dstBytesPerRow,
+                         srcBase + y * srcBytesPerRow,
+                         bytesPerRowToCopy);
+          }
 
           CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 
