@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <signal.h>
 
 #import "ScreenCapturer.h"
 #include "keysym2ucs.h"
@@ -164,6 +165,16 @@ static int specialKeyMap[] = {
 /* Global shifting modifier states */
 rfbBool isShiftDown;
 rfbBool isAltGrDown;
+
+/* set by the signal handler, checked by the main loop */
+static volatile sig_atomic_t shutdownRequested = FALSE;
+
+static void
+handleShutdownSignal(int sig)
+{
+    (void)sig;
+    shutdownRequested = TRUE;
+}
 
 
 static int
@@ -675,6 +686,9 @@ ScreenInit(int argc, char**argv)
 
   rfbInitServer(rfbScreen);
 
+  if(!rfbScreen->authPasswdData)
+      fprintf(stderr, "Warning: no password set, clients can connect without authentication. Set one via -passwd.\n");
+
   return TRUE;
 }
 
@@ -700,6 +714,10 @@ int main(int argc,char *argv[])
     if(strcmp(argv[i],"-viewonly")==0) {
       viewOnly=TRUE;
     } else if(strcmp(argv[i],"-display")==0) {
+	if(i+1 >= argc) {
+	    fprintf(stderr, "-display requires an argument\n");
+	    exit(EXIT_FAILURE);
+	}
 	displayNumber = atoi(argv[i+1]);
     } else if(strcmp(argv[i],"-h") == 0 || strcmp(argv[i],"--help") == 0)  {
         fprintf(stderr, "-viewonly              Do not allow any input\n");
@@ -727,13 +745,20 @@ int main(int argc,char *argv[])
       exit(1);
   rfbScreen->newClientHook = newClient;
 
+  signal(SIGINT, handleShutdownSignal);
+  signal(SIGTERM, handleShutdownSignal);
+
   rfbRunEventLoop(rfbScreen,-1,TRUE);
 
   /*
      The VNC machinery is in the background now and framebuffer updating happens on another thread as well.
   */
   while(1) {
-      /* Nothing left to do on the main thread. */
+      if(shutdownRequested) {
+          /* restore the pre-existing dim/sleep settings before quitting */
+          dimmingShutdown();
+          exit(0);
+      }
       sleep(1);
   }
 

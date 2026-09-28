@@ -59,6 +59,9 @@
         // set max frame rate to 60 FPS
         config.minimumFrameInterval = CMTimeMake(1, 60);
         config.pixelFormat = kCVPixelFormatType_32BGRA;
+        // unlike CGDisplayStream, ScreenCaptureKit does not draw the cursor
+        // into frames unless told to; the VNC clients rely on it being there
+        config.showsCursor = YES;
 
         SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:(display) excludingWindows:(@[])];
         self.stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:self];
