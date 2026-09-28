@@ -29,6 +29,7 @@
 
 #include <Carbon/Carbon.h>
 #include <ScreenCaptureKit/ScreenCaptureKit.h>
+#include <CoreMedia/CoreMedia.h>
 #include <rfb/rfb.h>
 #include <rfb/keysym.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
@@ -603,6 +604,13 @@ ScreenInit(int argc, char**argv)
           rfbClientIteratorPtr iterator;
           rfbClientPtr cl;
 
+          /* changed regions of this frame, used for the update marking below */
+          CGRect dirtyRects[64];
+          int dirtyRectCount = 0;
+          static unsigned long frameCount = 0;
+          rfbBool fullUpdate = (frameCount % 300) == 0; /* full update every 300 frames as a safety net */
+          frameCount++;
+
            /*
              Copy new frame to back buffer.
            */
@@ -644,6 +652,31 @@ ScreenInit(int argc, char**argv)
 
           CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 
+          /*
+            ScreenCaptureKit tags every frame with the rects that actually changed
+            since the previous one (macOS 14+). Using them instead of marking the
+            whole framebuffer drastically reduces the amount of data sent to
+            clients. The key is spelled as a literal string so the binary still
+            loads on older macOS, where we fall back to marking everything.
+          */
+          if(!fullUpdate) {
+              CFArrayRef dirtyRectArray = NULL;
+              if(@available(macOS 14.0, *))
+                  dirtyRectArray = (CFArrayRef)CMGetAttachment(sampleBuffer, (__bridge CFStringRef)@"SCStreamFrameInfoDirtyRects", NULL);
+              if(dirtyRectArray) {
+                  CGRect bounds = CGRectMake(0, 0, CGDisplayPixelsWide(displayID), CGDisplayPixelsHigh(displayID));
+                  CFIndex i, count = CFArrayGetCount(dirtyRectArray);
+                  for(i = 0; i < count && dirtyRectCount < 64; ++i) {
+                      CGRect rect;
+                      if(CGRectMakeWithDictionaryRepresentation((CFDictionaryRef)CFArrayGetValueAtIndex(dirtyRectArray, i), &rect)) {
+                          rect = CGRectIntersection(rect, bounds);
+                          if(!CGRectIsEmpty(rect))
+                              dirtyRects[dirtyRectCount++] = rect;
+                      }
+                  }
+              }
+          }
+
           /* Lock out client reads. */
           iterator=rfbGetClientIterator(rfbScreen);
           while((cl=rfbClientIteratorNext(iterator))) {
@@ -661,11 +694,22 @@ ScreenInit(int argc, char**argv)
           }
 
           /*
-            Mark modified rect in new framebuffer.
-            ScreenCaptureKit does not have something like CGDisplayStreamUpdateGetRects(),
-            so mark the whole framebuffer.
-           */
-          rfbMarkRectAsModified(rfbScreen, 0, 0, CGDisplayPixelsWide(displayID), CGDisplayPixelsHigh(displayID));
+            Mark the changed regions in the new framebuffer. Rects are in the
+            stream's coordinate space, which matches the framebuffer 1:1.
+          */
+          if(dirtyRectCount == 0) {
+              rfbMarkRectAsModified(rfbScreen, 0, 0, CGDisplayPixelsWide(displayID), CGDisplayPixelsHigh(displayID));
+          } else {
+              int i;
+              for(i = 0; i < dirtyRectCount; ++i) {
+                  CGRect rect = dirtyRects[i];
+                  rfbMarkRectAsModified(rfbScreen,
+                                        (int)rect.origin.x,
+                                        (int)rect.origin.y,
+                                        (int)ceil(rect.origin.x + rect.size.width),
+                                        (int)ceil(rect.origin.y + rect.size.height));
+              }
+          }
 
           /* Swapping framebuffers finished, reenable client reads. */
           iterator=rfbGetClientIterator(rfbScreen);
